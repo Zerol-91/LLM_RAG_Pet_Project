@@ -1,12 +1,15 @@
 import streamlit as st
 from openai import OpenAI
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+# import numpy as np
+# from sklearn.metrics.pairwise import cosine_similarity
 from pypdf import PdfReader # Библиотека для чтения PDF
+import chromadb 
+from chromadb.config import Settings
+
 
 # --- НАСТРОЙКИ ---
 st.set_page_config(page_title="RAG PDF Chat", page_icon="📄")
-st.title("📄 Чат с твоим PDF-файлом")
+st.title("📄 Чат с твоим PDF-файлом + память")
 
 #0 Подключение к "Кухне" (Ollama)
 client = OpenAI(
@@ -14,6 +17,12 @@ client = OpenAI(
     api_key='ollama',
 )
 
+# Мы говорим: "Храни данные в папке 'my_vector_db' прямо тут, в проекте"
+chroma_client = chromadb.PersistentClient(path="my_vector_db")
+collection = chroma_client.get_or_create_collection(
+    name="my_documents",
+    metadata={"hnsw:space": "cosine"} 
+)
 # 1. Функция чтения PDF
 def get_pdf_text(uploaded_file):
     text = ""
@@ -43,97 +52,88 @@ def get_embedding(text):
     return response.data[0].embedding
 
 
-
-# 4. Инициализация Памяти (Session State)
-# Сайт обновляется при каждом клике. Чтобы чат не исчезал,
-# мы храним его в специальном хранилище st.session_state.
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "vector_db" not in st.session_state:
-    st.session_state.vector_db = [] # Тут будем хранить векторы чанков
-
-
-
 # БОКОВАЯ ПАНЕЛЬ: Загрузка файла
 with st.sidebar:
-    st.header("📂 Загрузка документа")
+    st.header("📂 Загрузка")
     uploaded_file = st.file_uploader("Выберите PDF файл", type="pdf")
     
-    if uploaded_file and not st.session_state.vector_db:
-        with st.spinner("⏳ Читаю и анализирую файл... (это может занять время)"):
-            # А. Получаем текст
-            raw_text = get_pdf_text(uploaded_file)
-            st.success(f"Прочитано символов: {len(raw_text)}")
-            
-            # Б. Режем на кусочки
-            chunks = split_text(raw_text)
-            st.info(f"Нарезано на {len(chunks)} фрагментов.")
-            
-            # В. Создаем эмбеддинги (Самое долгое!)
-            # Сохраняем словарь: {"text": кусок_текста, "vector": вектор}
-            db = []
-            progress_bar = st.progress(0)
-            for i, chunk in enumerate(chunks):
-                vector = get_embedding(chunk)
-                db.append({"text": chunk, "vector": vector})
-                progress_bar.progress((i + 1) / len(chunks))
-            
-            st.session_state.vector_db = db # Сохраняем в память сессии
-            st.success("✅ Файл проиндексирован! Можете задавать вопросы.")
+    if uploaded_file:
+        filename = uploaded_file.name
+        
+        # ПРОВЕРКА: А вдруг мы этот файл уже читали?
+        # Мы ищем в базе записи, где source == filename
+        existing_docs = collection.get(where={"source": filename})
+        
+        if len(existing_docs['ids']) > 0:
+            st.success(f"Файл '{filename}' уже есть в базе.")
+        else:
+            with st.spinner("⏳ Индексирую новый файл..."):
+                text = get_pdf_text(uploaded_file)
+                chunks = split_text(text)
+                
+                # Подготовка данных для Chroma
+                ids = []       # Уникальные ID кусков (например "doc1_chunk0")
+                metadatas = [] # Описание (откуда кусок)
+                vectors = []   # Сами векторы
+                documents_text = [] # Текст кусков
+                
+                progress = st.progress(0)
+                for i, chunk in enumerate(chunks):
+                    vec = get_embedding(chunk)
+                    
+                    ids.append(f"{filename}_chunk{i}")
+                    metadatas.append({"source": filename})
+                    vectors.append(vec)
+                    documents_text.append(chunk)
+                    
+                    progress.progress((i+1)/len(chunks))
+                
+                # Загружаем всё в базу одной командой
+                collection.add(
+                    ids=ids,
+                    embeddings=vectors,
+                    documents=documents_text, # Chroma умеет хранить и сам текст!
+                    metadatas=metadatas
+                )
+                st.success("Сохранено на диск!")
 
 
-
-
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 # 4. Отрисовка истории чата
 # При обновлении страницы мы пробегаем по памяти и рисуем все прошлые сообщения
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# 5. Поле ввода (Ждем, пока юзер напишет и нажмет Enter)
-if prompt := st.chat_input("Напишите сообщение..."):
-    
-    # --- ДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЯ ---
-    # А. Показываем сообщение пользователя на экране
+if prompt := st.chat_input("Вопрос..."):
     with st.chat_message("user"):
         st.markdown(prompt)
-    # Б. Сохраняем его в память
     st.session_state.messages.append({"role": "user", "content": prompt})
 
+    query_vec = get_embedding(prompt)
 
-# 2. RAG: Поиск информации
-    if st.session_state.vector_db:
-        # А. Векторизуем вопрос
-        query_vector = get_embedding(prompt)
-        
-        # Б. Считаем сходство со всеми чанками
-        # Извлекаем все векторы из нашей базы
-        db_vectors = [item["vector"] for item in st.session_state.vector_db]
-        similarities = cosine_similarity([query_vector], db_vectors)[0]
-        
-        # В. Берем ТОП-3 лучших куска
-        top_indices = np.argsort(similarities)[-3:][::-1] # Сортируем и берем 3 последних (самых больших)
-        
-        # Собираем контекст из найденных кусков
-        context_text = ""
-        for idx in top_indices:
-            score = similarities[idx]
-            if score > 0.25: # Фильтр мусора
-                context_text += f"\n---\n{st.session_state.vector_db[idx]['text']}"
-        
-        # Г. Формируем системный промпт
-        system_prompt = f"""
-        Ты аналитик. Используй ТОЛЬКО следующий контекст для ответа на вопрос.
-        Если в контексте нет информации, скажи "В документе нет информации об этом".
-        
-        Контекст из документа:
-        {context_text}
-        """
+    results = collection.query(
+        query_embeddings=[query_vec],
+        n_results=3
+    )
+
+    valid_chunks = []
+    for i, dist in enumerate(results['distances'][0]):
+        if dist < 0.9: # Порог (надо подбирать экспериментально)
+            valid_chunks.append(results['documents'][0][i])
+
+    if not valid_chunks:
+    # Не отправлять запрос в Mistral вообще!
+        st.write("В базе нет ничего похожего.")
+
+    
+    context_text = "\n---\n".join(valid_chunks)
+    if not valid_chunks:
+        system_prompt = "Ты ассистент."
     else:
-        # Если файл не загружен, просто болтаем
-        system_prompt = "Ты полезный ассистент."
+        system_prompt = f"Ответь, используя контекст:\n{context_text}"
 
-    # 3. Генерация ответа
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
@@ -148,7 +148,6 @@ if prompt := st.chat_input("Напишите сообщение..."):
         )
 
         
-        # Г. Получаем ответ по кусочкам и обновляем текст на лету
         for chunk in stream:
             if chunk.choices[0].delta.content:
                 full_response += chunk.choices[0].delta.content
@@ -156,5 +155,4 @@ if prompt := st.chat_input("Напишите сообщение..."):
         
         message_placeholder.markdown(full_response) # Финальный текст без курсора
     
-    # Д. Сохраняем ответ бота в память
     st.session_state.messages.append({"role": "assistant", "content": full_response})
