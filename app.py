@@ -1,21 +1,34 @@
 import streamlit as st
 from openai import OpenAI
-# import numpy as np
-# from sklearn.metrics.pairwise import cosine_similarity
 from pypdf import PdfReader # Библиотека для чтения PDF
 import chromadb 
+import os
 from chromadb.config import Settings
-
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer 
 
 # --- НАСТРОЙКИ ---
-st.set_page_config(page_title="RAG PDF Chat", page_icon="📄")
-st.title("📄 Чат с твоим PDF-файлом + память")
+st.set_page_config(page_title="RAG Cloud Chat", page_icon="📄")
+st.title("☁️ Чат с PDF (OpenRouter + Local Embeddings)")
 
+load_dotenv() 
+api_key = os.getenv("OPENROUTER_API_KEY")
 
+if not api_key:
+    st.error("Не найден ключ API! Создайте файл .env и впишите туда OPENROUTER_API_KEY")
+    st.stop()
+
+# OpenRouter
 client = OpenAI(
-    base_url='http://localhost:11434/v1',
-    api_key='ollama',
+    base_url="https://openrouter.ai/api/v1",
+    api_key=api_key,
 )
+
+@st.cache_resource# Декоратор для единоразовой загрузки MiniLM
+def load_embedding_model():
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+embedding_model = load_embedding_model()
 
 
 chroma_client = chromadb.PersistentClient(path="my_vector_db")
@@ -52,6 +65,13 @@ def get_embedding(text):
     return response.data[0].embedding
 
 
+def get_embedding(text):
+    return embedding_model.encode(text).tolist()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+
 
 with st.sidebar:
     st.header("Загрузка")
@@ -59,14 +79,12 @@ with st.sidebar:
     
     if uploaded_file:
         filename = uploaded_file.name
-        
-
         existing_docs = collection.get(where={"source": filename})
         
         if len(existing_docs['ids']) > 0:
             st.success(f"Файл '{filename}' уже есть в базе.")
         else:
-            with st.spinner("⏳ Индексирую новый файл..."):
+            with st.spinner("Индексирую новый файл..."):
                 text = get_pdf_text(uploaded_file)
                 chunks = split_text(text)
                 
@@ -94,11 +112,8 @@ with st.sidebar:
                     documents=documents_text, 
                     metadatas=metadatas
                 )
-                st.success("Сохранено на диск!")
+                st.success("Сохранено в базу.")
 
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
 
 for message in st.session_state.messages:
@@ -111,65 +126,63 @@ if prompt := st.chat_input("Вопрос..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     query_vec = get_embedding(prompt)
-
     results = collection.query(
         query_embeddings=[query_vec],
         n_results=5
     )
 
     valid_chunks = []
-    for i, dist in enumerate(results['distances'][0]):
-        if dist < 0.7: # Порог (надо подбирать экспериментально)
-            valid_chunks.append(results['documents'][0][i])
-
-    if not valid_chunks:
-        st.write("В базе нет ничего похожего.")
-
-    
+    # Найденная в базе информация 
     with st.expander("Техническая информация (Что нашла база)"):
         found_chunks = results['documents'][0]
         distances = results['distances'][0]
             
-        context_text = ""
-        for i, chunk in enumerate(found_chunks):
-            dist = distances[i]
+        for i, dist in enumerate(distances):
+            chunk_text = found_chunks[i]
             st.write(f"**Кусок {i+1}** (Дистанция: {dist:.4f}):")
-            st.caption(chunk[:200] + "...") # Показываем начало куска
+            st.caption(chunk_text[:200] + "...") # Показываем начало куска
                 
             # Фильтр: берем только если дистанция меньше 0.7 (можно менять)
             if dist < 0.7:
-                context_text += f"\n---\n{chunk}"
+                st.success("Подходит")
+                valid_chunks.append(chunk_text)
             else:
                 st.warning("Этот кусок отброшен (слишком непохож)")
 
-
-
-    context_text = "\n---\n".join(valid_chunks)
+ 
     if not valid_chunks:
-        system_prompt = "Ты ассистент."
+        system_prompt = "Ты умный и полезный ассистент."
     else:
-        system_prompt = f"Ответь, используя контекст:\n{context_text}"
+        context_text = "\n---\n".join(valid_chunks)
+        system_prompt = f"Ответь как умный и полезный ассистент, используя контекст:\n{context_text}"
 
-    
+    # Генерация (OpenRouter)
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
         
-        stream = client.chat.completions.create(
-            model="mistral",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            stream=True,
-        )
 
+        try:
+            stream = client.chat.completions.create(
+                model="meta-llama/llama-3.3-70b-instruct:free", # Или "google/gemma-2-9b-it:free"
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                stream=True,
+                extra_headers={
+                    "HTTP-Referer": "http://localhost:8501",
+                    "X-Title": "Local RAG App"
+                }
+            )
+
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    full_response += chunk.choices[0].delta.content
+                    message_placeholder.markdown(full_response + "▌") # ▌ - это курсор
+            message_placeholder.markdown(full_response) # Финальный текст без курсора
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+        except Exception as e:
+            st.error(f"Ошибка API: {e}")
         
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                full_response += chunk.choices[0].delta.content
-                message_placeholder.markdown(full_response + "▌") # ▌ - это курсор
-        
-        message_placeholder.markdown(full_response) # Финальный текст без курсора
-    
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
